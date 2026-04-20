@@ -1,0 +1,24 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vot-exam-deployment
+  namespace: vot
+  labels:
+    app: vot-exam
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vot-exam
+  template:
+    metadata:
+      labels:
+        app: vot-exam
+    spec:
+      containers:
+      - name: vot-exam-container
+        image: dhdimitrov/vot-exam:5-amd
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http

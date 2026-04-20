@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: vot-exam-service
+  namespace: vot
+  labels:
+    app: vot-exam
+spec:
+  type: ClusterIP
+  selector:
+    app: vot-exam
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+    name: http
