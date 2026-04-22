@@ -1,94 +1,235 @@
+/*
+ * Kenbot — Battle Bot Controller
+ *
+ * Hardware:
+ *   - ESP32 WROOM-32
+ *   - PS4 controller via Bluepad32 (Bluetooth)
+ *   - Hoverboard mainboard (2× BLDC wheel motors) via UART2 TX only (GPIO 17)
+ *   - Custom brushed motor PCB (36V 500W weapon motor) via PWM + enable pin
+ *
+ * PS4 Button Map:
+ *   L2              — drive reverse
+ *   R2              — drive forward
+ *   Left stick X    — steer left/right
+ *   L1              — gear down (3→2→1)
+ *   R1              — gear up  (1→2→3)
+ *   O  (Circle)     — toggle hoverboard mainboard power (GPIO 22)
+ *   Square          — weapon hard stop (force to 0%)
+ *   D-pad UP        — weapon speed +1 stage (0→25→50→75→100%)
+ *   D-pad DOWN      — weapon speed -1 stage, wraps 0%→100%
+ */
+
 #include <Arduino.h>
 #include <Bluepad32.h>
-#define DEBUG_RX
 
-// ================= Pin mapping =================
-constexpr uint8_t kEBrakePin = 15;
-constexpr uint8_t kDirectionPin = 12;
-constexpr uint8_t kWeaponPin = 22;
+// ─────────────────────────────────────────────
+//  Pin mapping
+// ─────────────────────────────────────────────
+constexpr uint8_t kLEDPin             = 2;   // Built-in LED on ESP32 WROOM-32
+constexpr uint8_t kEBrakePin          = 15;  // Emergency brake (future use)
+constexpr uint8_t kDirectionPin       = 12;  // Direction pin (future use)
+constexpr uint8_t kHoverboardPowerPin = 22;  // Hoverboard mainboard ON/OFF
+constexpr uint8_t kWeaponPWMPin       = 25;  // PWM → J1 on weapon PCB
 
-// ================= Serial/config =================
+// ─────────────────────────────────────────────
+//  Weapon PWM config
+// ─────────────────────────────────────────────
+constexpr uint32_t kWeaponPWMFreq  = 100;  // 100 Hz
+constexpr uint8_t  kWeaponPWMRes   = 8;      // 8-bit → duty 0–255
+constexpr uint8_t  kWeaponPWMChan  = 0;      // LEDC channel (0–15 available)
+
+// Duty values for each of the 5 speed stages (0%, 25%, 50%, 75%, 100%)
+constexpr uint8_t kWeaponDuty[5] = {0, 64, 128, 192, 255};
+
+// ─────────────────────────────────────────────
+//  Hoverboard UART config (TX only — GPIO 17)
+// ─────────────────────────────────────────────
 constexpr uint32_t HOVER_SERIAL_BAUD = 115200;
-constexpr uint32_t SERIAL_BAUD = 115200;
-constexpr uint16_t START_FRAME = 0xABCD;
-constexpr uint32_t TIME_SEND_MS = 100;
+constexpr uint32_t SERIAL_BAUD       = 115200;
+constexpr uint16_t START_FRAME       = 0xABCD;  // Magic bytes that mark start of packet
+constexpr uint32_t TIME_SEND_MS      = 100;      // Send new command every 100 ms
 
-HardwareSerial HoverSerial(2);  // UART2
-ControllerPtr myControllers[BP32_MAX_GAMEPADS];
+// ─────────────────────────────────────────────
+//  Deadzone — sticks within ±5% of centre = 0
+// ─────────────────────────────────────────────
+constexpr int DEAD_ZONE = 50;  // out of mapped range ±1000
 
-// ================= Protocol types =================
+static inline int applyDeadzone(int val) {
+    return (abs(val) < DEAD_ZONE) ? 0 : val;
+}
+
+// ─────────────────────────────────────────────
+//  Hoverboard serial command packet
+//  Must match hoverboard firmware exactly (byte-for-byte)
+// ─────────────────────────────────────────────
 struct SerialCommand {
-    uint16_t start;
-    int16_t steer;
-    int16_t speed;
-    uint16_t checksum;
+    uint16_t start;     // Always START_FRAME
+    int16_t  steer;     // Steer value  −1000 … +1000
+    int16_t  speed;     // Speed value  −1000 … +1000
+    uint16_t checksum;  // XOR of start ^ steer ^ speed
 };
 
-struct SerialFeedback {
-    uint16_t start;
-    int16_t cmd1;
-    int16_t cmd2;
-    int16_t speedR_meas;
-    int16_t speedL_meas;
-    int16_t batVoltage;
-    int16_t boardTemp;
-    uint16_t cmdLed;
-    uint16_t checksum;
-};
+// ─────────────────────────────────────────────
+//  Global instances
+// ─────────────────────────────────────────────
+HardwareSerial HoverSerial(2);                   // UART2: TX only to hoverboard
+ControllerPtr  myControllers[BP32_MAX_GAMEPADS]; // Up to 4 gamepads
 
-// ================= Runtime state =================
 SerialCommand Command;
-SerialFeedback Feedback;
-SerialFeedback NewFeedback;
 
-uint8_t idx = 0;
-uint16_t bufStartFrame = 0;
-byte* p = nullptr;
-byte incomingByte = 0;
-byte incomingBytePrev = 0;
-
+// Drive state
 unsigned long iTimeSend = 0;
 int iSpeed = 0;
 int iSteer = 0;
-int gear = 1;
+int gear   = 1;  // 1–3: scales max speed to 33% / 66% / 100%
 
-// ================= Forward declarations =================
+// Toggle states
+bool hoverboardOn = false;  // Hoverboard mainboard power state
+int  weaponStage  = 0;      // 0=off, 1=25%, 2=50%, 3=75%, 4=100%
+
+// Weapon ramp — target is set instantly, current duty steps toward it each tick
+int weaponTargetDuty  = 0;
+int weaponCurrentDuty = 0;
+constexpr int kWeaponRampStep = 4;  // duty units per 15ms tick (~960ms full 0→100% ramp)
+
+// ─────────────────────────────────────────────
+//  LED status indicator (non-blocking)
+//
+//  Fast blink  (100ms)       — searching for controller
+//  Slow blink  (800ms)       — connected, standby
+//  Solid ON                  — hoverboard powered, ready to drive
+//  Double-blink every second — weapon armed (stage > 0)
+// ─────────────────────────────────────────────
+void updateLED() {
+    static unsigned long lastToggle = 0;
+    static int blinkStep = 0;
+    const unsigned long now = millis();
+
+    bool anyConnected = false;
+    for (auto ctl : myControllers) {
+        if (ctl && ctl->isConnected()) { anyConnected = true; break; }
+    }
+
+    if (weaponStage > 0) {
+        // Double-blink: ON-OFF-ON-PAUSE (100ms each, 600ms pause)
+        const unsigned long doubleBlink[] = {100, 100, 100, 600};
+        if (now - lastToggle >= doubleBlink[blinkStep % 4]) {
+            lastToggle = now;
+            blinkStep++;
+            digitalWrite(kLEDPin, (blinkStep % 4 < 2) ? HIGH : LOW);
+        }
+    } else if (!anyConnected) {
+        // Fast blink — searching
+        if (now - lastToggle >= 100) {
+            lastToggle = now;
+            digitalWrite(kLEDPin, !digitalRead(kLEDPin));
+        }
+    } else if (hoverboardOn) {
+        // Solid ON — hoverboard live
+        digitalWrite(kLEDPin, HIGH);
+    } else {
+        // Slow blink — connected but idle
+        if (now - lastToggle >= 800) {
+            lastToggle = now;
+            digitalWrite(kLEDPin, !digitalRead(kLEDPin));
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  PS4 lightbar
+//  Red   — weapon armed
+//  Green — hoverboard on, weapon off
+//  Blue  — connected standby
+// ─────────────────────────────────────────────
+void updateLightbar(ControllerPtr ctl) {
+    if (!ctl) return;
+    if (weaponStage > 0) {
+        ctl->setColorLED(255, 0, 0);    // red — weapon armed
+    } else if (hoverboardOn) {
+        ctl->setColorLED(0, 255, 0);    // green — hoverboard live
+    } else {
+        ctl->setColorLED(0, 0, 64);     // dim blue — standby
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Weapon ramp (non-blocking)
+//  Spin-up ramps gradually to protect motor and PCB.
+//  Spin-down cuts instantly for safety.
+// ─────────────────────────────────────────────
+void updateWeaponRamp() {
+    if (weaponCurrentDuty == weaponTargetDuty) return;
+
+    if (weaponCurrentDuty < weaponTargetDuty) {
+        weaponCurrentDuty = min(weaponTargetDuty, weaponCurrentDuty + kWeaponRampStep);
+    } else {
+        weaponCurrentDuty = weaponTargetDuty;  // drop instantly
+    }
+    ledcWrite(kWeaponPWMChan, weaponCurrentDuty);
+}
+
+// ─────────────────────────────────────────────
+//  Forward declarations
+// ─────────────────────────────────────────────
 void Send(int16_t uSteer, int16_t uSpeed);
-void Receive();
 void processControllers();
 void processGamepad(ControllerPtr ctl);
 void onConnectedController(ControllerPtr ctl);
 void onDisconnectedController(ControllerPtr ctl);
 
-// ================= Arduino lifecycle =================
+// ─────────────────────────────────────────────
+//  Setup
+// ─────────────────────────────────────────────
 void setup() {
     Serial.begin(SERIAL_BAUD);
-    Serial.println("Hoverboard Serial v1.0");
+    Serial.println("Kenbot booting...");
 
-    HoverSerial.begin(HOVER_SERIAL_BAUD, SERIAL_8N1, 16, 17);
-    Serial.println("Ready");
+    // UART2 TX only to hoverboard (RX=-1 unused, TX=17)
+    HoverSerial.begin(HOVER_SERIAL_BAUD, SERIAL_8N1, -1, 17);
 
+    // Bluepad32 — register callbacks then start BT scan
     BP32.setup(&onConnectedController, &onDisconnectedController);
-    BP32.forgetBluetoothKeys();
-    BP32.enableVirtualDevice(false);
+    delay(1000);  // Give Bluepad32 time to stabilize
+    // BP32.forgetBluetoothKeys();  // DISABLED: causes re-pairing loop on every boot
 
-    pinMode(kEBrakePin, OUTPUT);
+    pinMode(kLEDPin, OUTPUT);
+    digitalWrite(kLEDPin, LOW);
+
+    // Hoverboard pins (reserved for future use)
+    pinMode(kEBrakePin,    OUTPUT);
     pinMode(kDirectionPin, OUTPUT);
-    pinMode(kWeaponPin, OUTPUT);
+
+    // Hoverboard power toggle
+    pinMode(kHoverboardPowerPin, OUTPUT);
+    digitalWrite(kHoverboardPowerPin, LOW);
+
+    // Weapon motor controller — PWM on GPIO 25 → J1
+    ledcSetup(kWeaponPWMChan, kWeaponPWMFreq, kWeaponPWMRes);
+    ledcAttachPin(kWeaponPWMPin, kWeaponPWMChan);
+    ledcWrite(kWeaponPWMChan, 0);
+
+    Serial.println("Ready.");
 }
 
+// ─────────────────────────────────────────────
+//  Main loop
+// ─────────────────────────────────────────────
 void loop() {
-    if (BP32.update()) {
-        processControllers();
-    }
-    delay(10);
+    BP32.update();
+    processControllers();
+    updateWeaponRamp();
+    updateLED();
+    delay(15);
 }
 
-// ================= Controller callbacks =================
+// ─────────────────────────────────────────────
+//  Bluepad32 callbacks
+// ─────────────────────────────────────────────
 void onConnectedController(ControllerPtr ctl) {
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == nullptr) {
-            Serial.printf("Controller connected: %d\n", i);
+            Serial.printf("Controller connected: slot %d\n", i);
             myControllers[i] = ctl;
             return;
         }
@@ -98,14 +239,23 @@ void onConnectedController(ControllerPtr ctl) {
 void onDisconnectedController(ControllerPtr ctl) {
     for (int i = 0; i < BP32_MAX_GAMEPADS; i++) {
         if (myControllers[i] == ctl) {
-            Serial.printf("Controller disconnected: %d\n", i);
+            Serial.printf("Controller disconnected: slot %d\n", i);
             myControllers[i] = nullptr;
+
+            // Safety: stop drive and weapon immediately on disconnect
+            Send(0, 0);
+            weaponStage       = 0;
+            weaponTargetDuty  = 0;
+            weaponCurrentDuty = 0;
+            ledcWrite(kWeaponPWMChan, 0);
             return;
         }
     }
 }
 
-// ================= Controller processing =================
+// ─────────────────────────────────────────────
+//  Controller processing
+// ─────────────────────────────────────────────
 void processControllers() {
     for (auto ctl : myControllers) {
         if (ctl && ctl->isConnected() && ctl->hasData() && ctl->isGamepad()) {
@@ -115,12 +265,17 @@ void processControllers() {
 }
 
 void processGamepad(ControllerPtr ctl) {
-    Receive();
+    // ── Drive ──────────────────────────────────────────────────────
+    // R2 = forward (0–1023), L2 = reverse (0–1023)
+    iSpeed = ctl->throttle() - ctl->brake();                         // −1023 … +1023
+    iSpeed = applyDeadzone(map(iSpeed, -1023, 1023, -1000, 1000));
 
-    iSpeed = ctl->throttle() - ctl->brake();
-    iSpeed = map(iSpeed, -255, 255, -1000, 1000);
-    iSteer = map(ctl->axisX(), -128, 127, -1000, 1000);
-    //Serial.println(iSpeed);
+    // Left stick X: −512 … +511
+    iSteer = applyDeadzone(map(ctl->axisX(), -512, 511, -1000, 1000));
+
+    // Apply gear: gear 1=33%, gear 2=66%, gear 3=100% max speed
+    iSpeed = (iSpeed * gear) / 3;
+    iSteer = (iSteer * gear) / 3;
 
     const unsigned long timeNow = millis();
     if (iTimeSend <= timeNow) {
@@ -128,100 +283,62 @@ void processGamepad(ControllerPtr ctl) {
         Send(iSteer, iSpeed);
     }
 
-    if (ctl->buttons() == 0x0020 && gear < 3) {
+    // ── Gear shifting — R1 / L1 ────────────────────────────────────
+    if (ctl->buttons() == 0x0020 && gear < 3) {         // R1 — gear up
         gear++;
+        Serial.printf("Gear: %d\n", gear);
         delay(200);
-    } else if (ctl->buttons() == 0x0010 && gear > 1) {
+    } else if (ctl->buttons() == 0x0010 && gear > 1) {  // L1 — gear down
         gear--;
+        Serial.printf("Gear: %d\n", gear);
+        delay(200);
+
+    // ── O (Circle) — toggle hoverboard power ───────────────────────
+    } else if (ctl->buttons() == 0x0002) {
+        hoverboardOn = !hoverboardOn;
+        digitalWrite(kHoverboardPowerPin, hoverboardOn ? HIGH : LOW);
+        Serial.printf("Hoverboard: %s\n", hoverboardOn ? "ON" : "OFF");
+        delay(200);
+
+    // ── Square — weapon hard stop ───────────────────────────────────
+    } else if (ctl->buttons() == 0x0004) {
+        weaponStage = 0;
+        weaponTargetDuty  = 0;
+        weaponCurrentDuty = 0;  // also zero current so ramp doesn't continue
+        ledcWrite(kWeaponPWMChan, 0);
+        Serial.println("Weapon: HARD STOP");
         delay(200);
     }
 
+    // ── D-pad — weapon speed stages ────────────────────────────────
+    // UP ramps to next stage, DOWN cuts instantly to lower stage (wraps 0%→100%)
+    const uint8_t dpad = ctl->dpad();
+    if (dpad == 0x01) {  // D-pad UP — ramp up to new target
+        weaponStage = min(4, weaponStage + 1);
+        weaponTargetDuty = kWeaponDuty[weaponStage];
 
-    //  Serial.printf(
-    //     "idx=%d, dpad: 0x%02x, buttons: 0x%04x, axis L: %4d, %4d, axis R: %4d, %4d, brake: %4d, throttle: %4d, "
-    //     "misc: 0x%02x, gyro x:%6d y:%6d z:%6d, accel x:%6d y:%6d z:%6d\n",
-    //     ctl->index(),        // Controller Index
-    //     ctl->dpad(),         // D-pad
-    //     ctl->buttons(),      // bitmask of pressed buttons
-    //     ctl->axisX(),        // (-511 - 512) left X Axis
-    //     ctl->axisY(),        // (-511 - 512) left Y axis
-    //     ctl->axisRX(),       // (-511 - 512) right X axis
-    //     ctl->axisRY(),       // (-511 - 512) right Y axis
-    //     ctl->brake(),        // (0 - 1023): brake button
-    //     ctl->throttle(),     // (0 - 1023): throttle (AKA gas) button
-    //     ctl->miscButtons(),  // bitmask of pressed "misc" buttons
-    //     ctl->gyroX(),        // Gyro X
-    //     ctl->gyroY(),        // Gyro Y
-    //     ctl->gyroZ(),        // Gyro Z
-    //     ctl->accelX(),       // Accelerometer X
-    //     ctl->accelY(),       // Accelerometer Y
-    //     ctl->accelZ()        // Accelerometer Z
-    // );
+        Serial.printf("Weapon: %d%%\n", weaponStage * 25);
+        delay(200);
+    } else if (dpad == 0x02) {  // D-pad DOWN — instant cut to lower stage
+        weaponStage = (weaponStage == 0) ? 4 : weaponStage - 1;
+        weaponTargetDuty = kWeaponDuty[weaponStage];
 
+        Serial.printf("Weapon: %d%%\n", weaponStage * 25);
+        delay(200);
+    }
+
+    updateLightbar(ctl);
 }
 
-// ================= Hoverboard serial TX =================
+// ─────────────────────────────────────────────
+//  Hoverboard UART TX
+//  Packs steer + speed into framed protocol and sends over UART2.
+// ─────────────────────────────────────────────
 void Send(int16_t uSteer, int16_t uSpeed) {
-    Command.start = START_FRAME;
-    Command.steer = uSteer;
-    Command.speed = uSpeed;
+    Command.start    = START_FRAME;
+    Command.steer    = uSteer;
+    Command.speed    = uSpeed;
     Command.checksum = (uint16_t)(Command.start ^ Command.steer ^ Command.speed);
 
     HoverSerial.write((uint8_t*)&Command, sizeof(Command));
-}
-
-// ================= Hoverboard serial RX =================
-void Receive() {
-    if (HoverSerial.available()) {
-        incomingByte = HoverSerial.read();
-        bufStartFrame = ((uint16_t)(incomingByte) << 8) | incomingBytePrev;
-    } else {
-        return;
-    }
-
-#ifdef DEBUG_RX
-    Serial.print(incomingByte);
-    return;
-#endif
-
-    if (bufStartFrame == START_FRAME) {
-        p = (byte*)&NewFeedback;
-        *p++ = incomingBytePrev;
-        *p++ = incomingByte;
-        idx = 2;
-    } else if (idx >= 2 && idx < sizeof(SerialFeedback)) {
-        *p++ = incomingByte;
-        idx++;
-    }
-
-    if (idx == sizeof(SerialFeedback)) {
-        const uint16_t checksum = (uint16_t)(
-                NewFeedback.start ^ NewFeedback.cmd1 ^ NewFeedback.cmd2 ^
-                NewFeedback.speedR_meas ^ NewFeedback.speedL_meas ^ NewFeedback.batVoltage ^
-                NewFeedback.boardTemp ^ NewFeedback.cmdLed);
-
-        if (NewFeedback.start == START_FRAME && checksum == NewFeedback.checksum) {
-            memcpy(&Feedback, &NewFeedback, sizeof(SerialFeedback));
-
-            Serial.print("1: ");
-            Serial.print(Feedback.cmd1);
-            Serial.print(" 2: ");
-            Serial.print(Feedback.cmd2);
-            Serial.print(" 3: ");
-            Serial.print(Feedback.speedR_meas);
-            Serial.print(" 4: ");
-            Serial.print(Feedback.speedL_meas);
-            Serial.print(" 5: ");
-            Serial.print(Feedback.batVoltage);
-            Serial.print(" 6: ");
-            Serial.print(Feedback.boardTemp);
-            Serial.print(" 7: ");
-            Serial.println(Feedback.cmdLed);
-        } else {
-            Serial.println("Non-valid data skipped");
-        }
-        idx = 0;
-    }
-
-    incomingBytePrev = incomingByte;
 }
