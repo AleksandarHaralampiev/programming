@@ -84,8 +84,13 @@ int iSteer = 0;
 int gear   = 1;  // 1–3: scales max speed to 33% / 66% / 100%
 
 // Toggle states
-bool hoverboardOn = false;  // Hoverboard mainboard power state
+bool hoverboardOn = false;  // Tracks on/off for LED and lightbar
 int  weaponStage  = 0;      // 0=off, 1=25%, 2=50%, 3=75%, 4=100%
+
+// Hoverboard power pulse — simulates a button press (HIGH for 500ms then LOW)
+constexpr uint32_t kPowerPulseDuration = 500;
+bool          powerPulseActive = false;
+unsigned long powerPulseStart  = 0;
 
 // Weapon ramp — target is set instantly, current duty steps toward it each tick
 int weaponTargetDuty  = 0;
@@ -154,6 +159,18 @@ void updateLightbar(ControllerPtr ctl) {
 }
 
 // ─────────────────────────────────────────────
+//  Hoverboard power pulse (non-blocking)
+//  Pulls GPIO 22 HIGH for 500ms then releases — simulates pressing the power button.
+// ─────────────────────────────────────────────
+void updatePowerPulse() {
+    if (!powerPulseActive) return;
+    if (millis() - powerPulseStart >= kPowerPulseDuration) {
+        digitalWrite(kHoverboardPowerPin, LOW);
+        powerPulseActive = false;
+    }
+}
+
+// ─────────────────────────────────────────────
 //  Weapon ramp (non-blocking)
 //  Spin-up ramps gradually to protect motor and PCB.
 //  Spin-down cuts instantly for safety.
@@ -218,6 +235,7 @@ void setup() {
 void loop() {
     BP32.update();
     processControllers();
+    updatePowerPulse();
     updateWeaponRamp();
     updateLED();
     delay(15);
@@ -293,11 +311,13 @@ void processGamepad(ControllerPtr ctl) {
         Serial.printf("Gear: %d\n", gear);
         delay(200);
 
-    // ── O (Circle) — toggle hoverboard power ───────────────────────
-    } else if (ctl->buttons() == 0x0002) {
-        hoverboardOn = !hoverboardOn;
-        digitalWrite(kHoverboardPowerPin, hoverboardOn ? HIGH : LOW);
-        Serial.printf("Hoverboard: %s\n", hoverboardOn ? "ON" : "OFF");
+    // ── O (Circle) — pulse hoverboard power button for 500ms ───────
+    } else if (ctl->buttons() == 0x0002 && !powerPulseActive) {
+        hoverboardOn     = !hoverboardOn;
+        powerPulseActive = true;
+        powerPulseStart  = millis();
+        digitalWrite(kHoverboardPowerPin, HIGH);
+        Serial.printf("Hoverboard power pulse → %s\n", hoverboardOn ? "ON" : "OFF");
         delay(200);
 
     // ── Square — weapon hard stop ───────────────────────────────────
@@ -311,20 +331,19 @@ void processGamepad(ControllerPtr ctl) {
     }
 
     // ── D-pad — weapon speed stages ────────────────────────────────
-    // UP ramps to next stage, DOWN cuts instantly to lower stage (wraps 0%→100%)
+    // millis() debounce: only one stage change allowed per 350ms.
+    // This prevents skipping stages when the button is held or read twice.
+    static unsigned long lastDpadTime = 0;
     const uint8_t dpad = ctl->dpad();
-    if (dpad == 0x01) {  // D-pad UP — ramp up to new target
-        weaponStage = min(4, weaponStage + 1);
+    if (dpad != 0x00 && millis() - lastDpadTime >= 350) {
+        if (dpad == 0x01) {  // D-pad UP — ramp up to next stage
+            weaponStage = min(4, weaponStage + 1);
+        } else if (dpad == 0x02) {  // D-pad DOWN — instant cut, wraps 0%→100%
+            weaponStage = (weaponStage == 0) ? 4 : weaponStage - 1;
+        }
         weaponTargetDuty = kWeaponDuty[weaponStage];
-
+        lastDpadTime = millis();
         Serial.printf("Weapon: %d%%\n", weaponStage * 25);
-        delay(200);
-    } else if (dpad == 0x02) {  // D-pad DOWN — instant cut to lower stage
-        weaponStage = (weaponStage == 0) ? 4 : weaponStage - 1;
-        weaponTargetDuty = kWeaponDuty[weaponStage];
-
-        Serial.printf("Weapon: %d%%\n", weaponStage * 25);
-        delay(200);
     }
 
     updateLightbar(ctl);
